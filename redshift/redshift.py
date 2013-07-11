@@ -15,6 +15,9 @@ from sqlalchemy.dialects import util
 from sqlalchemy.dialects.postgresql.psycopg2 import _PGHStore, _PGArray, _PGEnum, _PGNumeric, PGExecutionContext_psycopg2, PGCompiler_psycopg2, PGIdentifierPreparer_psycopg2
 from sqlalchemy import types as sqltypes
 from sqlalchemy.dialects.postgresql.hstore import HSTORE
+from sqlalchemy.engine import reflection
+from sqlalchemy import sql
+from collections import defaultdict
 import re
 
 class PGDialect_RedShift(PGDialect):
@@ -167,5 +170,99 @@ class PGDialect_RedShift(PGDialect):
 			return "losed the connection unexpectedly" in str(e)
 		else:
 			return False
+
+	@reflection.cache
+	def get_pk_constraint(self, connection, table_name, schema=None, **kw):
+		table_oid = self.get_table_oid(connection, table_name, schema,
+									   info_cache=kw.get('info_cache'))
+		PK_SQL = """
+			SELECT a.attname
+			FROM
+				pg_class t
+				join pg_index ix on t.oid = ix.indrelid
+				join pg_attribute a
+					on t.oid=a.attrelid and a.attnum=pg_get_indexdef(ix.indrelid)
+			 WHERE
+			  t.oid = :table_oid and ix.indisprimary = 't'
+			ORDER BY a.attnum
+		"""
+		t = sql.text(PK_SQL, typemap={'attname': sqltypes.Unicode})
+		c = connection.execute(t, table_oid=table_oid)
+		cols = [r[0] for r in c.fetchall()]
+
+		PK_CONS_SQL = """
+		SELECT conname
+		   FROM  pg_catalog.pg_constraint r
+		   WHERE r.conrelid = :table_oid AND r.contype = 'p'
+		   ORDER BY 1
+		"""
+		t = sql.text(PK_CONS_SQL, typemap={'conname': sqltypes.Unicode})
+		c = connection.execute(t, table_oid=table_oid)
+		name = c.scalar()
+
+		return {'constrained_columns': cols, 'name': name}
+
+	@reflection.cache
+	def get_indexes(self, connection, table_name, schema, **kw):
+		table_oid = self.get_table_oid(connection, table_name, schema,
+									   info_cache=kw.get('info_cache'))
+
+		IDX_SQL = """
+		  SELECT
+			  i.relname as relname,
+			  ix.indisunique, ix.indexprs, ix.indpred,
+			  a.attname, a.attnum, ix.indkey
+		  FROM
+			  pg_class t
+					join pg_index ix on t.oid = ix.indrelid
+					join pg_class i on i.oid=ix.indexrelid
+					left outer join
+						pg_attribute a
+						on t.oid=a.attrelid and a.attnum=pg_get_indexdef(ix.indrelid)
+		  WHERE
+			  t.relkind = 'r'
+			  and t.oid = :table_oid
+			  and ix.indisprimary = 'f'
+		  ORDER BY
+			  t.relname,
+			  i.relname
+		"""
+
+		t = sql.text(IDX_SQL, typemap={'attname': sqltypes.Unicode})
+		c = connection.execute(t, table_oid=table_oid)
+
+		indexes = defaultdict(lambda: defaultdict(dict))
+
+		sv_idx_name = None
+		for row in c.fetchall():
+			idx_name, unique, expr, prd, col, col_num, idx_key = row
+
+			if expr:
+				if idx_name != sv_idx_name:
+					util.warn(
+					  "Skipped unsupported reflection of "
+					  "expression-based index %s"
+					  % idx_name)
+				sv_idx_name = idx_name
+				continue
+
+			if prd and not idx_name == sv_idx_name:
+				util.warn(
+				   "Predicate of partial index %s ignored during reflection"
+				   % idx_name)
+				sv_idx_name = idx_name
+
+			index = indexes[idx_name]
+			if col is not None:
+				index['cols'][col_num] = col
+			index['key'] = [int(k.strip()) for k in idx_key.split()]
+			index['unique'] = unique
+
+		return [
+			{'name': name,
+			 'unique': idx['unique'],
+			 'column_names': [idx['cols'][i] for i in idx['key']]}
+			for name, idx in indexes.items()
+		]
 
 dialect = PGDialect_RedShift
