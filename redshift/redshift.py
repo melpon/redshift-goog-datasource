@@ -21,6 +21,7 @@ from collections import defaultdict
 import re
 
 class PGDialect_RedShift(PGDialect):
+	name = 'redshift'
 	driver = 'psycopg2'
 	# Py2K
 	supports_unicode_statements = False
